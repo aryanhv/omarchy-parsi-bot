@@ -1,4 +1,4 @@
-name: Omarchy parsi bot
+name: Omarchy Parsi Bot
 
 on:
   schedule:
@@ -44,7 +44,7 @@ jobs:
             exit 0
           fi
 
-          git config user.name "Omarchy Parsi News Bot"
+          git config user.name "Omarchy Parsi Bot"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           git add state.json
