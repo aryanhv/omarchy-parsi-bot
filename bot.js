@@ -6,10 +6,13 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+
 const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const STATE_FILE = "state.json";
+
 const RLM = "\u200F";
+const LRM = "\u200E";
 
 const FEED_URLS = [
   process.env.RSS_URL,
@@ -86,6 +89,7 @@ async function fetchFeed() {
       }
 
       console.log(`Using feed: ${url}`);
+
       return xml;
     } catch (error) {
       console.log(`Failed ${url}: ${error.message}`);
@@ -142,6 +146,45 @@ function parseFeed(xml) {
   throw new Error("Unsupported RSS/Atom format.");
 }
 
+async function requestGeminiTranslation(model, prompt) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, 20000);
+
+  try {
+    return await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        signal: controller.signal,
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType: "application/json",
+          },
+        }),
+      },
+    );
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function translateToPersian(title, description) {
   if (!GEMINI_API_KEY) {
     console.log("No Gemini API key. Using original English text.");
@@ -180,16 +223,16 @@ TECHNICAL TERMINOLOGY:
   model names, URLs, package names, and version numbers in English.
 - Examples: Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom,
   GitHub, Linux, Gemini, Wayland.
-- Do not transliterate these names into Persian unless they are ordinary
-  English words rather than names.
+- Do not transliterate these names into Persian.
 - Translate general technical concepts when there is a natural Persian equivalent.
 
 PERSIAN WRITING:
-- Use Persian characters, not Arabic variants:
-  "ی" instead of "ي", and "ک" instead of "ك".
+- Use Persian characters, not Arabic variants.
+- Use "ی" instead of "ي".
+- Use "ک" instead of "ك".
 - Use proper Persian نیم‌فاصله where appropriate.
 - Avoid overly formal or literary vocabulary.
-- Avoid awkward calques from English.
+- Avoid awkward literal translations from English.
 - Keep the title short and news-like.
 
 Return ONLY valid JSON in exactly this shape:
@@ -207,107 +250,84 @@ ${description}
 
   const retryableStatuses = new Set([429, 500, 502, 503, 504]);
 
-  const retryDelays = [2000, 5000];
+  // Two attempts per model.
+  const attemptsPerModel = 2;
+  const retryDelay = 2000;
 
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const controller = new AbortController();
+  for (const model of GEMINI_MODELS) {
+    console.log(`Trying Gemini model: ${model}`);
 
-      const timeout = setTimeout(() => {
-        controller.abort();
-      }, 20000);
-
-      let response;
-
+    for (let attempt = 1; attempt <= attemptsPerModel; attempt++) {
       try {
-        response = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-          {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "x-goog-api-key": GEMINI_API_KEY,
-            },
-            signal: controller.signal,
-            body: JSON.stringify({
-              contents: [
-                {
-                  parts: [
-                    {
-                      text: prompt,
-                    },
-                  ],
-                },
-              ],
-              generationConfig: {
-                temperature: 0.2,
-                responseMimeType: "application/json",
-              },
-            }),
-          },
-        );
-      } finally {
-        clearTimeout(timeout);
-      }
+        console.log(`Gemini ${model} attempt ${attempt}/${attemptsPerModel}`);
 
-      if (!response.ok) {
-        const errorText = await response.text();
+        const response = await requestGeminiTranslation(model, prompt);
 
-        if (retryableStatuses.has(response.status) && attempt < 2) {
-          const delay = retryDelays[attempt];
+        if (!response.ok) {
+          const errorText = await response.text();
 
-          console.log(
-            `Gemini returned ${response.status}. ` +
-              `Retrying in ${delay / 1000}s...`,
+          console.error(
+            `Gemini ${model} returned ${response.status}: ${errorText}`,
           );
 
-          await sleep(delay);
-          continue;
+          if (
+            retryableStatuses.has(response.status) &&
+            attempt < attemptsPerModel
+          ) {
+            console.log(`Retrying ${model} in ${retryDelay / 1000}s...`);
+
+            await sleep(retryDelay);
+            continue;
+          }
+
+          break;
         }
 
-        throw new Error(`Gemini API returned ${response.status}: ${errorText}`);
-      }
+        const data = await response.json();
 
-      const data = await response.json();
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
-      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!text) {
+          throw new Error("Gemini returned no translation text.");
+        }
 
-      if (!text) {
-        throw new Error("Gemini returned no translation text.");
-      }
+        const translated = JSON.parse(text);
 
-      const translated = JSON.parse(text);
+        if (!translated.title || !translated.description) {
+          throw new Error("Gemini returned incomplete translation.");
+        }
 
-      if (!translated.title || !translated.description) {
-        throw new Error("Gemini returned incomplete translation.");
-      }
+        if (
+          !startsWithPersian(translated.title) ||
+          !startsWithPersian(translated.description)
+        ) {
+          throw new Error("Gemini returned non-RTL-safe Persian text.");
+        }
 
-      if (
-        !startsWithPersian(translated.title) ||
-        !startsWithPersian(translated.description)
-      ) {
-        throw new Error("Gemini returned non-RTL-safe Persian text.");
-      }
+        console.log(`Translation succeeded with ${model}.`);
 
-      return {
-        success: true,
-        title: translated.title.trim(),
-        description: translated.description.trim(),
-      };
-    } catch (error) {
-      console.error(`Gemini attempt ${attempt + 1} failed: ${error.message}`);
+        return {
+          success: true,
+          title: translated.title.trim(),
+          description: translated.description.trim(),
+        };
+      } catch (error) {
+        console.error(
+          `Gemini ${model} attempt ${attempt} failed: ${error.message}`,
+        );
 
-      if (attempt < 2) {
-        const delay = retryDelays[attempt];
+        if (attempt < attemptsPerModel) {
+          console.log(`Retrying ${model} in ${retryDelay / 1000}s...`);
 
-        console.log(`Retrying in ${delay / 1000}s...`);
-
-        await sleep(delay);
+          await sleep(retryDelay);
+        }
       }
     }
+
+    console.log(`${model} failed. Trying next Gemini model...`);
   }
 
-  console.log("All 3 Gemini attempts failed. Using original English text.");
+  console.log("All Gemini models failed. Using original English text.");
 
   return {
     success: false,
@@ -324,12 +344,15 @@ async function sendTelegramMessage(item) {
     originalDescription,
   );
 
+  // Persian content gets explicit RTL.
+  // English fallback gets no direction forcing.
   const contentDirection = translated.success ? RLM : "";
 
   const sourceLine = `${RLM}<a href="${escapeHtml(
     item.link,
   )}">مطالعه خبر اصلی در Omarchy</a>`;
-  const LRM = "\u200E";
+
+  // Explicitly keep community attribution LTR / left aligned.
   const communityLine = `${LRM}🆔 <a href="https://t.me/OmarchyParsi">@OmarchyParsi</a>`;
 
   let text = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
@@ -339,6 +362,7 @@ async function sendTelegramMessage(item) {
   }
 
   text += `\n\n${sourceLine}`;
+
   text += `\n\n${communityLine}`;
 
   const response = await fetch(
@@ -369,6 +393,7 @@ async function main() {
   const state = loadState();
 
   const xml = await fetchFeed();
+
   const items = parseFeed(xml);
 
   if (items.length === 0) {
@@ -379,7 +404,7 @@ async function main() {
   const newestItem = items[0];
 
   // First run:
-  // remember the current newest article
+  // remember the newest article
   // without posting old history.
   if (!state.lastItemId) {
     console.log(`First run. Setting baseline to: ${newestItem.title}`);
@@ -402,8 +427,8 @@ async function main() {
   let newItems;
 
   if (previousIndex === -1) {
-    // If the old item has fallen out of
-    // the feed, avoid flooding Telegram.
+    // If the old article has fallen
+    // out of the feed, avoid flooding.
     newItems = [newestItem];
   } else {
     newItems = items.slice(0, previousIndex).reverse();
