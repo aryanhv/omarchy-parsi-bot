@@ -1,0 +1,12 @@
+{
+  "name": "omarchy-parsi-news-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node bot.js"
+  },
+  "dependencies": {
+    "fast-xml-parser": "^5.0.9"
+  }
+}

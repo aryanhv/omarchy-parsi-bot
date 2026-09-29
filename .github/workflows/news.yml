@@ -1,0 +1,57 @@
+name: Omarchy News Bot
+
+on:
+  schedule:
+    - cron: "0 */12 * * *"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: omarchy-news-bot
+  cancel-in-progress: false
+
+jobs:
+  post-news:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Check Omarchy news
+        run: node bot.js
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC_ID: ${{ secrets.TELEGRAM_TOPIC_ID }}
+
+      - name: Save bot state
+        run: |
+          if [ ! -f state.json ]; then
+            echo "No state file."
+            exit 0
+          fi
+
+          git config user.name "Omarchy Parsi News Bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add state.json
+
+          if git diff --cached --quiet; then
+            echo "No state change."
+            exit 0
+          fi
+
+          git commit -m "Update news bot state"
+          git push
