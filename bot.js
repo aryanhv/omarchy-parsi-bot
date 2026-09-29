@@ -58,6 +58,10 @@ function startsWithPersian(text = "") {
   return /^[\s\u200F]*[\u0600-\u06FF]/.test(text);
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function fetchFeed() {
   for (const url of FEED_URLS) {
     try {
@@ -143,6 +147,7 @@ async function translateToPersian(title, description) {
     console.log("No Gemini API key. Using original English text.");
 
     return {
+      success: false,
       title,
       description,
     };
@@ -200,74 +205,98 @@ Description:
 ${description}
 `;
 
+  const retryableStatuses = new Set([429, 500, 502, 503, 504]);
+
+  const retryDelays = [2000, 5000];
+
   try {
-    const response = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
-        },
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.2,
-            responseMimeType: "application/json",
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY,
           },
-        }),
-      },
-    );
-
-    if (!response.ok) {
-      throw new Error(
-        `Gemini API returned ${response.status}: ${await response.text()}`,
+          body: JSON.stringify({
+            contents: [
+              {
+                parts: [
+                  {
+                    text: prompt,
+                  },
+                ],
+              },
+            ],
+            generationConfig: {
+              temperature: 0.2,
+              responseMimeType: "application/json",
+            },
+          }),
+        },
       );
+
+      if (response.ok) {
+        const data = await response.json();
+
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+        if (!text) {
+          throw new Error("Gemini returned no translation text.");
+        }
+
+        const translated = JSON.parse(text);
+
+        if (!translated.title || !translated.description) {
+          throw new Error("Gemini returned incomplete translation.");
+        }
+
+        if (
+          !startsWithPersian(translated.title) ||
+          !startsWithPersian(translated.description)
+        ) {
+          throw new Error("Gemini returned non-RTL-safe Persian text.");
+        }
+
+        return {
+          success: true,
+          title: translated.title.trim(),
+          description: translated.description.trim(),
+        };
+      }
+
+      const errorText = await response.text();
+
+      const hasAnotherAttempt = attempt < 2;
+
+      if (retryableStatuses.has(response.status) && hasAnotherAttempt) {
+        const delay = retryDelays[attempt];
+
+        console.log(
+          `Gemini returned ${response.status}. ` +
+            `Retrying in ${delay / 1000}s...`,
+        );
+
+        await sleep(delay);
+        continue;
+      }
+
+      throw new Error(`Gemini API returned ${response.status}: ${errorText}`);
     }
-
-    const data = await response.json();
-
-    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-    if (!text) {
-      throw new Error("Gemini returned no translation text.");
-    }
-
-    const translated = JSON.parse(text);
-
-    if (!translated.title || !translated.description) {
-      throw new Error("Gemini returned incomplete translation.");
-    }
-
-    if (
-      !startsWithPersian(translated.title) ||
-      !startsWithPersian(translated.description)
-    ) {
-      throw new Error("Gemini returned non-RTL-safe Persian text.");
-    }
-
-    return {
-      title: translated.title.trim(),
-      description: translated.description.trim(),
-    };
   } catch (error) {
-    console.error(`Gemini translation failed: ${error.message}`);
-
-    console.log("Falling back to original English text.");
-
-    return {
-      title,
-      description,
-    };
+    console.error(
+      `Gemini translation failed after 3 attempts: ${error.message}`,
+    );
   }
+
+  console.log("Using original English text without RTL forcing.");
+
+  return {
+    success: false,
+    title,
+    description,
+  };
 }
 
 async function sendTelegramMessage(item) {
@@ -278,15 +307,21 @@ async function sendTelegramMessage(item) {
     originalDescription,
   );
 
-  let text = `${RLM}📰 <b>${escapeHtml(translated.title)}</b>`;
+  const directionPrefix = translated.success ? RLM : "";
+
+  const linkText = translated.success
+    ? "مطالعه خبر اصلی در Omarchy"
+    : "Read the original news on Omarchy";
+
+  let text = `${directionPrefix}📰 <b>${escapeHtml(translated.title)}</b>`;
 
   if (translated.description) {
-    text += `\n\n${RLM}${escapeHtml(translated.description)}`;
+    text += `\n\n${directionPrefix}${escapeHtml(translated.description)}`;
   }
 
-  text += `\n\n${RLM}<a href="${escapeHtml(
+  text += `\n\n${directionPrefix}<a href="${escapeHtml(
     item.link,
-  )}">مطالعه خبر اصلی در Omarchy</a>`;
+  )}">${escapeHtml(linkText)}</a>`;
 
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
