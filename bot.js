@@ -6,7 +6,7 @@ const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-3.5-flash";
+const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const STATE_FILE = "state.json";
 const RLM = "\u200F";
@@ -329,8 +329,8 @@ async function sendTelegramMessage(item) {
   const sourceLine = `${RLM}<a href="${escapeHtml(
     item.link,
   )}">مطالعه خبر اصلی در Omarchy</a>`;
-
-  const communityLine = `${RLM}🆔 <a href="https://t.me/OmarchyParsi">@OmarchyParsi</a>`;
+  const LRM = "\u200E";
+  const communityLine = `${LRM}🆔 <a href="https://t.me/OmarchyParsi">@OmarchyParsi</a>`;
 
   let text = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
 
