@@ -209,88 +209,105 @@ ${description}
 
   const retryDelays = [2000, 5000];
 
-  try {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      const response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY,
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                parts: [
-                  {
-                    text: prompt,
-                  },
-                ],
-              },
-            ],
-            generationConfig: {
-              temperature: 0.2,
-              responseMimeType: "application/json",
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const controller = new AbortController();
+
+      const timeout = setTimeout(() => {
+        controller.abort();
+      }, 20000);
+
+      let response;
+
+      try {
+        response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "x-goog-api-key": GEMINI_API_KEY,
             },
-          }),
-        },
-      );
-
-      if (response.ok) {
-        const data = await response.json();
-
-        const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
-
-        if (!text) {
-          throw new Error("Gemini returned no translation text.");
-        }
-
-        const translated = JSON.parse(text);
-
-        if (!translated.title || !translated.description) {
-          throw new Error("Gemini returned incomplete translation.");
-        }
-
-        if (
-          !startsWithPersian(translated.title) ||
-          !startsWithPersian(translated.description)
-        ) {
-          throw new Error("Gemini returned non-RTL-safe Persian text.");
-        }
-
-        return {
-          success: true,
-          title: translated.title.trim(),
-          description: translated.description.trim(),
-        };
+            signal: controller.signal,
+            body: JSON.stringify({
+              contents: [
+                {
+                  parts: [
+                    {
+                      text: prompt,
+                    },
+                  ],
+                },
+              ],
+              generationConfig: {
+                temperature: 0.2,
+                responseMimeType: "application/json",
+              },
+            }),
+          },
+        );
+      } finally {
+        clearTimeout(timeout);
       }
 
-      const errorText = await response.text();
+      if (!response.ok) {
+        const errorText = await response.text();
 
-      const hasAnotherAttempt = attempt < 2;
+        if (retryableStatuses.has(response.status) && attempt < 2) {
+          const delay = retryDelays[attempt];
 
-      if (retryableStatuses.has(response.status) && hasAnotherAttempt) {
+          console.log(
+            `Gemini returned ${response.status}. ` +
+              `Retrying in ${delay / 1000}s...`,
+          );
+
+          await sleep(delay);
+          continue;
+        }
+
+        throw new Error(`Gemini API returned ${response.status}: ${errorText}`);
+      }
+
+      const data = await response.json();
+
+      const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+      if (!text) {
+        throw new Error("Gemini returned no translation text.");
+      }
+
+      const translated = JSON.parse(text);
+
+      if (!translated.title || !translated.description) {
+        throw new Error("Gemini returned incomplete translation.");
+      }
+
+      if (
+        !startsWithPersian(translated.title) ||
+        !startsWithPersian(translated.description)
+      ) {
+        throw new Error("Gemini returned non-RTL-safe Persian text.");
+      }
+
+      return {
+        success: true,
+        title: translated.title.trim(),
+        description: translated.description.trim(),
+      };
+    } catch (error) {
+      console.error(`Gemini attempt ${attempt + 1} failed: ${error.message}`);
+
+      if (attempt < 2) {
         const delay = retryDelays[attempt];
 
-        console.log(
-          `Gemini returned ${response.status}. ` +
-            `Retrying in ${delay / 1000}s...`,
-        );
+        console.log(`Retrying in ${delay / 1000}s...`);
 
         await sleep(delay);
-        continue;
       }
-
-      throw new Error(`Gemini API returned ${response.status}: ${errorText}`);
     }
-  } catch (error) {
-    console.error(
-      `Gemini translation failed after 3 attempts: ${error.message}`,
-    );
   }
 
-  console.log("Using original English text without RTL forcing.");
+  console.log("All 3 Gemini attempts failed. Using original English text.");
 
   return {
     success: false,
@@ -307,21 +324,22 @@ async function sendTelegramMessage(item) {
     originalDescription,
   );
 
-  const directionPrefix = translated.success ? RLM : "";
+  const contentDirection = translated.success ? RLM : "";
 
-  const linkText = translated.success
-    ? "مطالعه خبر اصلی در Omarchy"
-    : "Read the original news on Omarchy";
+  const sourceLine = `${RLM}<a href="${escapeHtml(
+    item.link,
+  )}">مطالعه خبر اصلی در Omarchy</a>`;
 
-  let text = `${directionPrefix}📰 <b>${escapeHtml(translated.title)}</b>`;
+  const communityLine = `${RLM}🆔 <a href="https://t.me/OmarchyParsi">@OmarchyParsi</a>`;
+
+  let text = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
 
   if (translated.description) {
-    text += `\n\n${directionPrefix}${escapeHtml(translated.description)}`;
+    text += `\n\n${contentDirection}${escapeHtml(translated.description)}`;
   }
 
-  text += `\n\n${directionPrefix}<a href="${escapeHtml(
-    item.link,
-  )}">${escapeHtml(linkText)}</a>`;
+  text += `\n\n${sourceLine}`;
+  text += `\n\n${communityLine}`;
 
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
