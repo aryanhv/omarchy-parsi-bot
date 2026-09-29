@@ -4,6 +4,8 @@ import { XMLParser } from "fast-xml-parser";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const GEMINI_MODEL = "gemini-3.5-flash-lite";
 
 const STATE_FILE = "state.json";
 
@@ -130,13 +132,98 @@ function parseFeed(xml) {
   throw new Error("Unsupported RSS/Atom format.");
 }
 
+async function translateToPersian(title, description) {
+  if (!GEMINI_API_KEY) {
+    console.log("No Gemini API key. Using original English text.");
+    return { title, description };
+  }
+
+  const prompt = `
+Translate the following Omarchy news item into natural, fluent Persian.
+
+Rules:
+- Preserve technical names and proper nouns such as Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom, Linux, GitHub, model names, commands, URLs, and version numbers in English.
+- Do not add information that is not present in the source.
+- Do not summarize beyond the supplied text.
+- Keep the tone clear and suitable for a Persian-speaking technology community.
+- Return ONLY valid JSON in exactly this shape:
+{"title":"...","description":"..."}
+
+Title:
+${title}
+
+Description:
+${description}
+`;
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              parts: [
+                {
+                  text: prompt,
+                },
+              ],
+            },
+          ],
+          generationConfig: {
+            temperature: 0.2,
+            responseMimeType: "application/json",
+          },
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(
+        `Gemini API returned ${response.status}: ${await response.text()}`,
+      );
+    }
+
+    const data = await response.json();
+
+    const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+
+    if (!text) {
+      throw new Error("Gemini returned no text.");
+    }
+
+    const translated = JSON.parse(text);
+
+    if (!translated.title || !translated.description) {
+      throw new Error("Gemini returned incomplete translation.");
+    }
+
+    return translated;
+  } catch (error) {
+    console.error(`Gemini translation failed: ${error.message}`);
+    console.log("Falling back to original English text.");
+
+    return { title, description };
+  }
+}
+
 async function sendTelegramMessage(item) {
-  const description = stripHtml(item.description).slice(0, 500);
+  const originalDescription = stripHtml(item.description).slice(0, 500);
 
-  let text = `📰 <b>${escapeHtml(item.title)}</b>`;
+  const translated = await translateToPersian(
+    String(item.title),
+    originalDescription,
+  );
 
-  if (description) {
-    text += `\n\n${escapeHtml(description)}`;
+  let text = `📰 <b>${escapeHtml(translated.title)}</b>`;
+
+  if (translated.description) {
+    text += `\n\n${escapeHtml(translated.description)}`;
   }
 
   text += `\n\n<a href="${escapeHtml(item.link)}">مطالعه خبر اصلی در Omarchy</a>`;
