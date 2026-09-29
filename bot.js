@@ -4,10 +4,12 @@ import { XMLParser } from "fast-xml-parser";
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = "gemini-3.5-flash-lite";
+const GEMINI_MODEL = "gemini-3.5-flash";
 
 const STATE_FILE = "state.json";
+const RLM = "\u200F";
 
 const FEED_URLS = [
   process.env.RSS_URL,
@@ -52,6 +54,10 @@ function toArray(value) {
   return Array.isArray(value) ? value : [value];
 }
 
+function startsWithPersian(text = "") {
+  return /^[\s\u200F]*[\u0600-\u06FF]/.test(text);
+}
+
 async function fetchFeed() {
   for (const url of FEED_URLS) {
     try {
@@ -59,7 +65,7 @@ async function fetchFeed() {
 
       const response = await fetch(url, {
         headers: {
-          "User-Agent": "OmarchyParsiNewsBot/1.0",
+          "User-Agent": "OmarchyParsiBot/1.0",
         },
       });
 
@@ -135,19 +141,57 @@ function parseFeed(xml) {
 async function translateToPersian(title, description) {
   if (!GEMINI_API_KEY) {
     console.log("No Gemini API key. Using original English text.");
-    return { title, description };
+
+    return {
+      title,
+      description,
+    };
   }
 
   const prompt = `
-Translate the following Omarchy news item into natural, fluent Persian.
+You are the Persian editor for a technology community focused on Omarchy.
 
-Rules:
-- Preserve technical names and proper nouns such as Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom, Linux, GitHub, model names, commands, URLs, and version numbers in English.
-- Do not add information that is not present in the source.
-- Do not summarize beyond the supplied text.
-- Keep the tone clear and suitable for a Persian-speaking technology community.
-- Return ONLY valid JSON in exactly this shape:
-{"title":"...","description":"..."}
+Translate the following Omarchy news item from English into polished,
+natural Persian suitable for publication in a Telegram technology community.
+
+TRANSLATION STYLE:
+- Write fluent, idiomatic Persian, not word-for-word machine translation.
+- Use contemporary Persian commonly used by Iranian software developers.
+- Keep the tone professional, clear, concise, and readable.
+- Preserve the exact meaning and factual content.
+- Do not add opinions, explanations, or information not present in the source.
+- Do not omit meaningful information.
+- Prefer natural Persian sentence structure over English sentence structure.
+
+RTL REQUIREMENT:
+- Every title and description MUST begin with a Persian word.
+- Never begin a title or paragraph with an English proper noun.
+- If the English sentence begins with a name such as "ThePrimeagen",
+  restructure it naturally in Persian.
+- This is important because the text will be displayed right-to-left.
+
+TECHNICAL TERMINOLOGY:
+- Keep established product names, usernames, project names, commands,
+  model names, URLs, package names, and version numbers in English.
+- Examples: Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom,
+  GitHub, Linux, Gemini, Wayland.
+- Do not transliterate these names into Persian unless they are ordinary
+  English words rather than names.
+- Translate general technical concepts when there is a natural Persian equivalent.
+
+PERSIAN WRITING:
+- Use Persian characters, not Arabic variants:
+  "ی" instead of "ي", and "ک" instead of "ك".
+- Use proper Persian نیم‌فاصله where appropriate.
+- Avoid overly formal or literary vocabulary.
+- Avoid awkward calques from English.
+- Keep the title short and news-like.
+
+Return ONLY valid JSON in exactly this shape:
+{
+  "title": "...",
+  "description": "..."
+}
 
 Title:
 ${title}
@@ -194,7 +238,7 @@ ${description}
     const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
 
     if (!text) {
-      throw new Error("Gemini returned no text.");
+      throw new Error("Gemini returned no translation text.");
     }
 
     const translated = JSON.parse(text);
@@ -203,12 +247,26 @@ ${description}
       throw new Error("Gemini returned incomplete translation.");
     }
 
-    return translated;
+    if (
+      !startsWithPersian(translated.title) ||
+      !startsWithPersian(translated.description)
+    ) {
+      throw new Error("Gemini returned non-RTL-safe Persian text.");
+    }
+
+    return {
+      title: translated.title.trim(),
+      description: translated.description.trim(),
+    };
   } catch (error) {
     console.error(`Gemini translation failed: ${error.message}`);
+
     console.log("Falling back to original English text.");
 
-    return { title, description };
+    return {
+      title,
+      description,
+    };
   }
 }
 
@@ -220,13 +278,15 @@ async function sendTelegramMessage(item) {
     originalDescription,
   );
 
-  let text = `📰 <b>${escapeHtml(translated.title)}</b>`;
+  let text = `${RLM}📰 <b>${escapeHtml(translated.title)}</b>`;
 
   if (translated.description) {
-    text += `\n\n${escapeHtml(translated.description)}`;
+    text += `\n\n${RLM}${escapeHtml(translated.description)}`;
   }
 
-  text += `\n\n<a href="${escapeHtml(item.link)}">مطالعه خبر اصلی در Omarchy</a>`;
+  text += `\n\n${RLM}<a href="${escapeHtml(
+    item.link,
+  )}">مطالعه خبر اصلی در Omarchy</a>`;
 
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -266,7 +326,8 @@ async function main() {
   const newestItem = items[0];
 
   // First run:
-  // remember the current newest article without posting old history.
+  // remember the current newest article
+  // without posting old history.
   if (!state.lastItemId) {
     console.log(`First run. Setting baseline to: ${newestItem.title}`);
 
@@ -288,8 +349,8 @@ async function main() {
   let newItems;
 
   if (previousIndex === -1) {
-    // If the old item has fallen out of the feed,
-    // avoid flooding Telegram.
+    // If the old item has fallen out of
+    // the feed, avoid flooding Telegram.
     newItems = [newestItem];
   } else {
     newItems = items.slice(0, previousIndex).reverse();
