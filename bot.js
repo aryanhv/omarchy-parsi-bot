@@ -22,6 +22,64 @@ const FEED_URLS = [
   "https://omarchy.org/feed.xml",
 ].filter(Boolean);
 
+const TRANSLATION_SYSTEM_INSTRUCTION = `
+You are the Persian editor for a technology community focused on Omarchy.
+
+Translate the given Omarchy news item from English into polished,
+natural Persian suitable for publication in a Telegram technology community.
+
+TRANSLATION STYLE:
+- Write fluent, idiomatic Persian, not word-for-word machine translation.
+- Use contemporary Persian commonly used by Iranian software developers.
+- Keep the tone professional, clear, concise, and readable.
+- Preserve the exact meaning and factual content.
+- Do not add opinions, explanations, or information not present in the source.
+- Do not omit meaningful information.
+- Prefer natural Persian sentence structure over English sentence structure.
+- If full article context is provided, use it to write a clear, informative
+  2-3 sentence Persian summary (up to ~450 characters) without inventing facts.
+
+RTL REQUIREMENT:
+- Every title and description paragraph MUST begin with a Persian word.
+- Never begin a title or paragraph with an English proper noun.
+- If the English sentence begins with a name such as "ThePrimeagen",
+  restructure it naturally in Persian.
+- This is important because the text will be displayed right-to-left.
+
+TECHNICAL TERMINOLOGY:
+- Keep established product names, usernames, project names, commands,
+  model names, URLs, package names, and version numbers in English.
+- Examples: Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom,
+  GitHub, Linux, Gemini, Wayland.
+- Do not transliterate these names into Persian.
+- Translate general technical concepts when there is a natural Persian equivalent.
+
+PERSIAN WRITING:
+- Use Persian characters, not Arabic variants.
+- Use "ی" instead of "ي".
+- Use "ک" instead of "ك".
+- Use proper Persian نیم‌فاصله where appropriate.
+- Avoid overly formal or literary vocabulary.
+- Avoid awkward literal translations from English.
+- Keep the title short and news-like.
+`.trim();
+
+const TRANSLATION_RESPONSE_SCHEMA = {
+  type: "OBJECT",
+  properties: {
+    title: {
+      type: "STRING",
+      description: "Concise Persian news title starting with a Persian word.",
+    },
+    description: {
+      type: "STRING",
+      description:
+        "Natural Persian news summary starting with a Persian word.",
+    },
+  },
+  required: ["title", "description"],
+};
+
 if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
   throw new Error("Missing Telegram environment variables.");
 }
@@ -47,9 +105,31 @@ function escapeHtml(text = "") {
 
 function stripHtml(text = "") {
   return String(text)
-    .replace(/<[^>]*>/g, "")
+    .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function normalizePersian(text = "") {
+  return String(text)
+    .replaceAll("\u064A", "\u06CC") // Arabic Yeh -> Persian Yeh
+    .replaceAll("\u0649", "\u06CC") // Alef Maksura -> Persian Yeh
+    .replaceAll("\u0643", "\u06A9") // Arabic Kaf -> Persian Kaf
+    .replace(/ *\u200C */g, "\u200C")
+    .replace(/\r\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function applyRtl(text = "") {
+  return String(text)
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return "";
+      return trimmed.startsWith(RLM) ? trimmed : `${RLM}${trimmed}`;
+    })
+    .join("\n");
 }
 
 function toArray(value) {
@@ -58,7 +138,7 @@ function toArray(value) {
 }
 
 function startsWithPersian(text = "") {
-  return /^[\s\u200F]*[\u0600-\u06FF]/.test(text);
+  return /^[\s\u200F«»"'\(\[\u06F0-\u06F9]*[\u0600-\u06FF]/.test(text);
 }
 
 function sleep(ms) {
@@ -114,6 +194,8 @@ function parseFeed(xml) {
       title: item.title ?? "Omarchy News",
       link: item.link,
       description: item.description ?? item["content:encoded"] ?? "",
+      content: item["content:encoded"] ?? "",
+      author: item["dc:creator"] ?? item.author ?? "",
       date: item.pubDate ?? "",
     }));
   }
@@ -138,6 +220,8 @@ function parseFeed(xml) {
           item.content?.["#text"] ??
           item.content ??
           "",
+        content: item.content?.["#text"] ?? item.content ?? "",
+        author: item.author?.name ?? "",
         date: item.updated ?? item.published ?? "",
       };
     });
@@ -146,7 +230,7 @@ function parseFeed(xml) {
   throw new Error("Unsupported RSS/Atom format.");
 }
 
-async function requestGeminiTranslation(model, prompt) {
+async function requestGeminiTranslation(model, userPrompt) {
   const controller = new AbortController();
 
   const timeout = setTimeout(() => {
@@ -164,11 +248,19 @@ async function requestGeminiTranslation(model, prompt) {
         },
         signal: controller.signal,
         body: JSON.stringify({
+          systemInstruction: {
+            parts: [
+              {
+                text: TRANSLATION_SYSTEM_INSTRUCTION,
+              },
+            ],
+          },
           contents: [
             {
+              role: "user",
               parts: [
                 {
-                  text: prompt,
+                  text: userPrompt,
                 },
               ],
             },
@@ -176,6 +268,7 @@ async function requestGeminiTranslation(model, prompt) {
           generationConfig: {
             temperature: 0.2,
             responseMimeType: "application/json",
+            responseSchema: TRANSLATION_RESPONSE_SCHEMA,
           },
         }),
       },
@@ -185,7 +278,7 @@ async function requestGeminiTranslation(model, prompt) {
   }
 }
 
-async function translateToPersian(title, description) {
+async function translateToPersian(title, description, context = {}) {
   if (!GEMINI_API_KEY) {
     console.log("No Gemini API key. Using original English text.");
 
@@ -196,57 +289,17 @@ async function translateToPersian(title, description) {
     };
   }
 
-  const prompt = `
-You are the Persian editor for a technology community focused on Omarchy.
+  const parts = [`Title:\n${title}`, `Description:\n${description}`];
 
-Translate the following Omarchy news item from English into polished,
-natural Persian suitable for publication in a Telegram technology community.
+  if (context.author) {
+    parts.push(`Author:\n${context.author}`);
+  }
 
-TRANSLATION STYLE:
-- Write fluent, idiomatic Persian, not word-for-word machine translation.
-- Use contemporary Persian commonly used by Iranian software developers.
-- Keep the tone professional, clear, concise, and readable.
-- Preserve the exact meaning and factual content.
-- Do not add opinions, explanations, or information not present in the source.
-- Do not omit meaningful information.
-- Prefer natural Persian sentence structure over English sentence structure.
+  if (context.articleText && context.articleText !== description) {
+    parts.push(`Article Context:\n${context.articleText}`);
+  }
 
-RTL REQUIREMENT:
-- Every title and description MUST begin with a Persian word.
-- Never begin a title or paragraph with an English proper noun.
-- If the English sentence begins with a name such as "ThePrimeagen",
-  restructure it naturally in Persian.
-- This is important because the text will be displayed right-to-left.
-
-TECHNICAL TERMINOLOGY:
-- Keep established product names, usernames, project names, commands,
-  model names, URLs, package names, and version numbers in English.
-- Examples: Omarchy, Hyprland, ThePrimeagen, Omakub, Omacom,
-  GitHub, Linux, Gemini, Wayland.
-- Do not transliterate these names into Persian.
-- Translate general technical concepts when there is a natural Persian equivalent.
-
-PERSIAN WRITING:
-- Use Persian characters, not Arabic variants.
-- Use "ی" instead of "ي".
-- Use "ک" instead of "ك".
-- Use proper Persian نیم‌فاصله where appropriate.
-- Avoid overly formal or literary vocabulary.
-- Avoid awkward literal translations from English.
-- Keep the title short and news-like.
-
-Return ONLY valid JSON in exactly this shape:
-{
-  "title": "...",
-  "description": "..."
-}
-
-Title:
-${title}
-
-Description:
-${description}
-`;
+  const userPrompt = parts.join("\n\n");
 
   const retryableStatuses = new Set([429, 500, 502, 503, 504]);
 
@@ -261,7 +314,7 @@ ${description}
       try {
         console.log(`Gemini ${model} attempt ${attempt}/${attemptsPerModel}`);
 
-        const response = await requestGeminiTranslation(model, prompt);
+        const response = await requestGeminiTranslation(model, userPrompt);
 
         if (!response.ok) {
           const errorText = await response.text();
@@ -297,9 +350,12 @@ ${description}
           throw new Error("Gemini returned incomplete translation.");
         }
 
+        const normalizedTitle = normalizePersian(translated.title);
+        const normalizedDescription = normalizePersian(translated.description);
+
         if (
-          !startsWithPersian(translated.title) ||
-          !startsWithPersian(translated.description)
+          !startsWithPersian(normalizedTitle) ||
+          !startsWithPersian(normalizedDescription)
         ) {
           throw new Error("Gemini returned non-RTL-safe Persian text.");
         }
@@ -308,8 +364,8 @@ ${description}
 
         return {
           success: true,
-          title: translated.title.trim(),
-          description: translated.description.trim(),
+          title: normalizedTitle,
+          description: normalizedDescription,
         };
       } catch (error) {
         console.error(
@@ -338,13 +394,18 @@ ${description}
 
 async function sendTelegramMessage(item) {
   const originalDescription = stripHtml(item.description).slice(0, 500);
+  const articleText = stripHtml(item.content).slice(0, 1500);
 
   const translated = await translateToPersian(
     String(item.title),
     originalDescription,
+    {
+      author: stripHtml(item.author),
+      articleText,
+    },
   );
 
-  // Persian content gets explicit RTL.
+  // Persian content gets explicit RTL on every paragraph.
   // English fallback gets no direction forcing.
   const contentDirection = translated.success ? RLM : "";
 
@@ -358,7 +419,10 @@ async function sendTelegramMessage(item) {
   let text = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
 
   if (translated.description) {
-    text += `\n\n${contentDirection}${escapeHtml(translated.description)}`;
+    const formattedDescription = translated.success
+      ? applyRtl(escapeHtml(translated.description))
+      : escapeHtml(translated.description);
+    text += `\n\n${formattedDescription}`;
   }
 
   text += `\n\n${sourceLine}`;
