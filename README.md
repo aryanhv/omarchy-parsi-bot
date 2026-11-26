@@ -79,6 +79,23 @@ GEMINI_API_KEY
 
 Never commit API keys or bot tokens directly to the repository.
 
+Optional environment variables:
+
+```text
+TELEGRAM_PARSE_MODE   # "HTML" (default) or "MarkdownV2"
+```
+
+## Sending Markdown messages
+
+You can also send arbitrary Markdown messages or files directly to Telegram (automatically converted and escaped for Telegram `MarkdownV2`):
+
+```bash
+node bot.js --markdown "**Hello** from [Omarchy Parsi](https://t.me/OmarchyParsi)!"
+node bot.js --markdown-file announcement.md
+```
+
+Add `--dry-run` to preview the escaped `MarkdownV2` output without sending.
+
 ## Community
 
 Telegram:

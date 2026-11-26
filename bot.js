@@ -1,9 +1,15 @@
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { XMLParser } from "fast-xml-parser";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
+const PARSE_MODE =
+  (process.env.TELEGRAM_PARSE_MODE || "HTML").toLowerCase() === "markdownv2"
+    ? "MarkdownV2"
+    : "HTML";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
@@ -22,10 +28,6 @@ const FEED_URLS = [
   "https://omarchy.org/feed.xml",
 ].filter(Boolean);
 
-if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
-  throw new Error("Missing Telegram environment variables.");
-}
-
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
     return { lastItemId: null };
@@ -43,6 +45,133 @@ function escapeHtml(text = "") {
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;");
+}
+
+export function escapeMarkdownV2(text = "") {
+  return String(text).replace(/([_*\[\]()~`>#+\-=|{}.!\\])/g, "\\$1");
+}
+
+export function escapeMarkdownV2Url(url = "") {
+  return String(url).replace(/([)\\])/g, "\\$1");
+}
+
+export function escapeMarkdownV2Code(code = "") {
+  return String(code).replace(/([`\\])/g, "\\$1");
+}
+
+/**
+ * Converts standard Markdown (headings, bold, italic, strikethrough, inline/fenced code,
+ * links, blockquotes, bullet lists) into valid Telegram MarkdownV2.
+ */
+export function markdownToTelegramMarkdownV2(markdown = "") {
+  const placeholders = [];
+  const stash = (value) => {
+    const token = `\uE000${placeholders.length}\uE001`;
+    placeholders.push(value);
+    return token;
+  };
+
+  let text = String(markdown).replace(/\r\n/g, "\n");
+
+  // 1. Fenced code blocks: ```lang\n...\n```
+  text = text.replace(
+    /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g,
+    (_match, lang, code) => {
+      const cleanCode = code.replace(/\n$/, "");
+      return stash(
+        `\`\`\`${lang}\n${escapeMarkdownV2Code(cleanCode)}\n\`\`\``,
+      );
+    },
+  );
+
+  // 2. Inline code: `code`
+  text = text.replace(/`([^`\n]+)`/g, (_match, code) =>
+    stash(`\`${escapeMarkdownV2Code(code)}\``),
+  );
+
+  // 3. Links: [label](url) (supports one level of balanced parentheses in URLs)
+  text = text.replace(
+    /\[([^\]]+)\]\(((?:[^()\s]+|\([^()\s]*\))+)\)/g,
+    (_match, label, url) =>
+      stash(`[${escapeMarkdownV2(label)}](${escapeMarkdownV2Url(url)})`),
+  );
+
+  // 4. Process line-level and inline formatting safely
+  const formatInline = (segment) => {
+    const inlineTokens = [];
+    const stashInline = (val) => {
+      const token = `\uE002${inlineTokens.length}\uE003`;
+      inlineTokens.push(val);
+      return token;
+    };
+
+    let s = segment;
+
+    // Bold: **text** or __text__
+    s = s.replace(/\*\*(.+?)\*\*/g, (_m, inner) =>
+      stashInline(`*${escapeMarkdownV2(inner)}*`),
+    );
+    s = s.replace(/__(.+?)__/g, (_m, inner) =>
+      stashInline(`*${escapeMarkdownV2(inner)}*`),
+    );
+
+    // Strikethrough: ~~text~~
+    s = s.replace(/~~(.+?)~~/g, (_m, inner) =>
+      stashInline(`~${escapeMarkdownV2(inner)}~`),
+    );
+
+    // Italic: *text* (not inside words)
+    s = s.replace(/(^|[\s(\[«])\*([^*\n]+)\*(?=$|[\s.,!?;:)\]»])/g, (_m, pre, inner) =>
+      `${pre}${stashInline(`_${escapeMarkdownV2(inner)}_`)}`,
+    );
+
+    // Escape all remaining plain text (preserving stash placeholders)
+    s = s
+      .split(/(\uE000\d+\uE001|\uE002\d+\uE003)/g)
+      .map((part) => {
+        if (/^\uE000\d+\uE001$|^\uE002\d+\uE003$/.test(part)) {
+          return part;
+        }
+        return escapeMarkdownV2(part);
+      })
+      .join("");
+
+    // Restore inline tokens
+    s = s.replace(/\uE002(\d+)\uE003/g, (_m, idx) => inlineTokens[Number(idx)]);
+    return s;
+  };
+
+  const formattedLines = text.split("\n").map((line) => {
+    // Preserve standalone fenced code block placeholders as-is
+    if (/^\uE000\d+\uE001$/.test(line.trim())) {
+      return line.trim();
+    }
+
+    // Headings: # Title -> *Title*
+    const headingMatch = line.match(/^#{1,6}\s+(.+)$/);
+    if (headingMatch) {
+      return `*${escapeMarkdownV2(headingMatch[1].trim())}*`;
+    }
+
+    // Blockquotes: > quote
+    const quoteMatch = line.match(/^>\s?(.*)$/);
+    if (quoteMatch) {
+      return `>${formatInline(quoteMatch[1])}`;
+    }
+
+    // Bullet lists: - item or * item -> • item
+    const bulletMatch = line.match(/^(\s*)[-*]\s+(.+)$/);
+    if (bulletMatch) {
+      return `${bulletMatch[1]}• ${formatInline(bulletMatch[2])}`;
+    }
+
+    return formatInline(line);
+  });
+
+  // Restore top-level placeholders (code blocks, inline code, links)
+  return formattedLines
+    .join("\n")
+    .replace(/\uE000(\d+)\uE001/g, (_m, idx) => placeholders[Number(idx)]);
 }
 
 function stripHtml(text = "") {
@@ -336,17 +465,26 @@ ${description}
   };
 }
 
-async function sendTelegramMessage(item) {
-  const originalDescription = stripHtml(item.description).slice(0, 500);
-
-  const translated = await translateToPersian(
-    String(item.title),
-    originalDescription,
-  );
-
+export function formatNewsMessage(item, translated, parseMode = PARSE_MODE) {
   // Persian content gets explicit RTL.
   // English fallback gets no direction forcing.
   const contentDirection = translated.success ? RLM : "";
+
+  if (parseMode === "MarkdownV2") {
+    const sourceLine = `${RLM}[${escapeMarkdownV2("مطالعه خبر اصلی در Omarchy")}](${escapeMarkdownV2Url(item.link)})`;
+    const communityLine = `${LRM}🆔 [${escapeMarkdownV2("@OmarchyParsi")}](https://t.me/OmarchyParsi)`;
+
+    let text = `${contentDirection}📰 *${escapeMarkdownV2(translated.title)}*`;
+
+    if (translated.description) {
+      text += `\n\n${contentDirection}${escapeMarkdownV2(translated.description)}`;
+    }
+
+    text += `\n\n${sourceLine}`;
+    text += `\n\n${communityLine}`;
+
+    return { text, parseMode: "MarkdownV2" };
+  }
 
   const sourceLine = `${RLM}<a href="${escapeHtml(
     item.link,
@@ -365,6 +503,18 @@ async function sendTelegramMessage(item) {
 
   text += `\n\n${communityLine}`;
 
+  return { text, parseMode: "HTML" };
+}
+
+async function sendTelegramRaw({
+  text,
+  parseMode = "HTML",
+  disableWebPagePreview = false,
+}) {
+  if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
+    throw new Error("Missing Telegram environment variables.");
+  }
+
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
     {
@@ -376,8 +526,8 @@ async function sendTelegramMessage(item) {
         chat_id: CHAT_ID,
         message_thread_id: Number(TOPIC_ID),
         text,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
+        parse_mode: parseMode,
+        disable_web_page_preview: disableWebPagePreview,
       }),
     },
   );
@@ -387,9 +537,80 @@ async function sendTelegramMessage(item) {
   if (!response.ok || !result.ok) {
     throw new Error(`Telegram error: ${JSON.stringify(result)}`);
   }
+
+  return result;
+}
+
+export async function sendTelegramMarkdown(
+  markdown,
+  { dryRun = false, disableWebPagePreview = false } = {},
+) {
+  const text = markdownToTelegramMarkdownV2(markdown);
+
+  if (dryRun) {
+    console.log(text);
+    return { ok: true, dryRun: true, text };
+  }
+
+  return sendTelegramRaw({
+    text,
+    parseMode: "MarkdownV2",
+    disableWebPagePreview,
+  });
+}
+
+async function sendTelegramMessage(item) {
+  const originalDescription = stripHtml(item.description).slice(0, 500);
+
+  const translated = await translateToPersian(
+    String(item.title),
+    originalDescription,
+  );
+
+  const { text, parseMode } = formatNewsMessage(item, translated, PARSE_MODE);
+
+  await sendTelegramRaw({
+    text,
+    parseMode,
+    disableWebPagePreview: false,
+  });
+}
+
+function parseCliArgs(argv) {
+  const args = {
+    markdown: null,
+    markdownFile: null,
+    dryRun: argv.includes("--dry-run") || process.env.DRY_RUN === "1",
+  };
+
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--markdown" && argv[i + 1]) {
+      args.markdown = argv[i + 1];
+      i++;
+    } else if (argv[i] === "--markdown-file" && argv[i + 1]) {
+      args.markdownFile = argv[i + 1];
+      i++;
+    }
+  }
+
+  return args;
 }
 
 async function main() {
+  const cli = parseCliArgs(process.argv.slice(2));
+
+  if (cli.markdown !== null || cli.markdownFile !== null) {
+    const content = cli.markdownFile
+      ? fs.readFileSync(cli.markdownFile, "utf8")
+      : cli.markdown;
+    await sendTelegramMarkdown(content, { dryRun: cli.dryRun });
+    return;
+  }
+
+  if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
+    throw new Error("Missing Telegram environment variables.");
+  }
+
   const state = loadState();
 
   const xml = await fetchFeed();
@@ -446,7 +667,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}
