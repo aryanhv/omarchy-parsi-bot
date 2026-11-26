@@ -1,6 +1,9 @@
 import fs from "node:fs";
 import { XMLParser } from "fast-xml-parser";
 
+const DRY_RUN =
+  process.argv.includes("--dry-run") || process.env.DRY_RUN === "1";
+
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
@@ -10,6 +13,8 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const STATE_FILE = "state.json";
+const TELEGRAM_MAX_MESSAGE_LENGTH = 4096;
+const INTER_POST_DELAY_MS = 1500;
 
 const RLM = "\u200F";
 const LRM = "\u200E";
@@ -22,8 +27,10 @@ const FEED_URLS = [
   "https://omarchy.org/feed.xml",
 ].filter(Boolean);
 
-if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
-  throw new Error("Missing Telegram environment variables.");
+if (!DRY_RUN && (!BOT_TOKEN || !CHAT_ID)) {
+  throw new Error(
+    "Missing Telegram environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).",
+  );
 }
 
 function loadState() {
@@ -63,6 +70,21 @@ function startsWithPersian(text = "") {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function formatJalaliDate(dateString) {
+  if (!dateString) return "";
+
+  const parsed = new Date(dateString);
+  if (Number.isNaN(parsed.getTime())) return "";
+
+  try {
+    return new Intl.DateTimeFormat("fa-IR-u-ca-persian", {
+      dateStyle: "medium",
+    }).format(parsed);
+  } catch {
+    return "";
+  }
 }
 
 async function fetchFeed() {
@@ -114,6 +136,7 @@ function parseFeed(xml) {
       title: item.title ?? "Omarchy News",
       link: item.link,
       description: item.description ?? item["content:encoded"] ?? "",
+      author: item["dc:creator"] ?? item.author ?? "",
       date: item.pubDate ?? "",
     }));
   }
@@ -138,6 +161,7 @@ function parseFeed(xml) {
           item.content?.["#text"] ??
           item.content ??
           "",
+        author: item.author?.name ?? "",
         date: item.updated ?? item.published ?? "",
       };
     });
@@ -336,17 +360,25 @@ ${description}
   };
 }
 
-async function sendTelegramMessage(item) {
-  const originalDescription = stripHtml(item.description).slice(0, 500);
-
-  const translated = await translateToPersian(
-    String(item.title),
-    originalDescription,
-  );
-
+function buildTelegramPayload(item, translated) {
   // Persian content gets explicit RTL.
   // English fallback gets no direction forcing.
   const contentDirection = translated.success ? RLM : "";
+
+  const headerLine = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
+
+  const metaParts = [];
+  const author = stripHtml(item.author);
+  const jalaliDate = formatJalaliDate(item.date);
+
+  if (author) {
+    metaParts.push(`✍️ ${escapeHtml(author)}`);
+  }
+  if (jalaliDate) {
+    metaParts.push(`📅 ${escapeHtml(jalaliDate)}`);
+  }
+
+  const metaLine = metaParts.length > 0 ? `${RLM}${metaParts.join(" · ")}` : "";
 
   const sourceLine = `${RLM}<a href="${escapeHtml(
     item.link,
@@ -355,15 +387,78 @@ async function sendTelegramMessage(item) {
   // Explicitly keep community attribution LTR / left aligned.
   const communityLine = `${LRM}🆔 <a href="https://t.me/OmarchyParsi">@OmarchyParsi</a>`;
 
-  let text = `${contentDirection}📰 <b>${escapeHtml(translated.title)}</b>`;
+  const suffixParts = [metaLine, sourceLine, communityLine].filter(Boolean);
+  const suffix = `\n\n${suffixParts.join("\n\n")}`;
+
+  let descriptionBlock = "";
 
   if (translated.description) {
-    text += `\n\n${contentDirection}${escapeHtml(translated.description)}`;
+    const escapedDesc = escapeHtml(translated.description);
+    const maxDescLength =
+      TELEGRAM_MAX_MESSAGE_LENGTH -
+      headerLine.length -
+      suffix.length -
+      contentDirection.length -
+      4; // "\n\n" + safety margin
+
+    const safeDesc =
+      escapedDesc.length > maxDescLength
+        ? `${escapedDesc.slice(0, Math.max(0, maxDescLength - 1)).trimEnd()}…`
+        : escapedDesc;
+
+    if (safeDesc) {
+      descriptionBlock = `\n\n${contentDirection}${safeDesc}`;
+    }
   }
 
-  text += `\n\n${sourceLine}`;
+  const text = `${headerLine}${descriptionBlock}${suffix}`;
 
-  text += `\n\n${communityLine}`;
+  const payload = {
+    chat_id: CHAT_ID,
+    text,
+    parse_mode: "HTML",
+    disable_web_page_preview: false,
+  };
+
+  if (TOPIC_ID) {
+    payload.message_thread_id = Number(TOPIC_ID);
+  }
+
+  if (item.link) {
+    payload.reply_markup = {
+      inline_keyboard: [
+        [
+          {
+            text: "مطالعه خبر اصلی ↗️",
+            url: item.link,
+          },
+        ],
+      ],
+    };
+  }
+
+  return payload;
+}
+
+async function sendTelegramMessage(item) {
+  const originalDescription = stripHtml(item.description).slice(0, 500);
+
+  const translated = await translateToPersian(
+    String(item.title),
+    originalDescription,
+  );
+
+  const payload = buildTelegramPayload(item, translated);
+
+  if (DRY_RUN) {
+    console.log("\n--- DRY RUN TELEGRAM PAYLOAD ---");
+    console.log(payload.text);
+    if (payload.reply_markup) {
+      console.log("Inline keyboard:", JSON.stringify(payload.reply_markup));
+    }
+    console.log("--- END DRY RUN ---\n");
+    return;
+  }
 
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -372,13 +467,7 @@ async function sendTelegramMessage(item) {
       headers: {
         "Content-Type": "application/json",
       },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        message_thread_id: Number(TOPIC_ID),
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
-      }),
+      body: JSON.stringify(payload),
     },
   );
 
@@ -402,6 +491,12 @@ async function main() {
   }
 
   const newestItem = items[0];
+
+  if (DRY_RUN) {
+    console.log("Dry-run mode enabled. Previewing newest item without modifying state.");
+    await sendTelegramMessage(newestItem);
+    return;
+  }
 
   // First run:
   // remember the newest article
@@ -434,7 +529,8 @@ async function main() {
     newItems = items.slice(0, previousIndex).reverse();
   }
 
-  for (const item of newItems) {
+  for (let index = 0; index < newItems.length; index++) {
+    const item = newItems[index];
     console.log(`Posting: ${item.title}`);
 
     await sendTelegramMessage(item);
@@ -443,6 +539,10 @@ async function main() {
       lastItemId: item.id,
       updatedAt: new Date().toISOString(),
     });
+
+    if (index < newItems.length - 1) {
+      await sleep(INTER_POST_DELAY_MS);
+    }
   }
 }
 
