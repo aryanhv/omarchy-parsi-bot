@@ -101,7 +101,3 @@ Bot:
 ## Purpose
 
 This project currently handles Omarchy news, but `Omarchy Parsi Bot` is intentionally kept general so more community features can be added later.
-
-```
-
-```
