@@ -10,6 +10,13 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const STATE_FILE = "state.json";
+const MAX_PROCESSED_IDS = 100;
+
+const FEED_TIMEOUT_MS = 15000;
+const GEMINI_TIMEOUT_MS = 20000;
+const TELEGRAM_TIMEOUT_MS = 15000;
+
+const RETRYABLE_STATUSES = new Set([429, 500, 502, 503, 504]);
 
 const RLM = "\u200F";
 const LRM = "\u200E";
@@ -22,34 +29,111 @@ const FEED_URLS = [
   "https://omarchy.org/feed.xml",
 ].filter(Boolean);
 
+const HTML_ENTITIES = {
+  "&amp;": "&",
+  "&lt;": "<",
+  "&gt;": ">",
+  "&quot;": '"',
+  "&apos;": "'",
+  "&#39;": "'",
+  "&nbsp;": " ",
+  "&rsquo;": "\u2019",
+  "&lsquo;": "\u2018",
+  "&rdquo;": "\u201D",
+  "&ldquo;": "\u201C",
+  "&mdash;": "\u2014",
+  "&ndash;": "\u2013",
+  "&hellip;": "\u2026",
+};
+
 if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
   throw new Error("Missing Telegram environment variables.");
 }
 
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { lastItemId: null };
+    return { lastItemId: null, processedIds: [] };
   }
 
-  return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+  const processedIds = Array.isArray(parsed.processedIds)
+    ? parsed.processedIds
+    : parsed.lastItemId
+      ? [parsed.lastItemId]
+      : [];
+
+  return {
+    ...parsed,
+    lastItemId: parsed.lastItemId ?? null,
+    processedIds,
+  };
 }
 
 function saveState(state) {
-  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2) + "\n");
+  const uniqueIds = [...new Set(state.processedIds ?? [])].slice(
+    -MAX_PROCESSED_IDS,
+  );
+
+  fs.writeFileSync(
+    STATE_FILE,
+    JSON.stringify(
+      {
+        lastItemId: state.lastItemId,
+        processedIds: uniqueIds,
+        updatedAt: state.updatedAt,
+      },
+      null,
+      2,
+    ) + "\n",
+  );
+}
+
+function decodeHtmlEntities(text = "") {
+  return String(text)
+    .replace(/&(?:#x([0-9a-fA-F]+)|#(\d+)|([a-zA-Z]+));/g, (match, hex, dec) => {
+      if (hex) {
+        const code = Number.parseInt(hex, 16);
+        return Number.isNaN(code) ? match : String.fromCodePoint(code);
+      }
+
+      if (dec) {
+        const code = Number.parseInt(dec, 10);
+        return Number.isNaN(code) ? match : String.fromCodePoint(code);
+      }
+
+      return HTML_ENTITIES[match.toLowerCase()] ?? match;
+    });
 }
 
 function escapeHtml(text = "") {
   return String(text)
     .replaceAll("&", "&amp;")
     .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
 }
 
 function stripHtml(text = "") {
-  return String(text)
-    .replace(/<[^>]*>/g, "")
+  return decodeHtmlEntities(String(text).replace(/<[^>]*>/g, " "))
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function truncateAtWord(text = "", maxLength = 500) {
+  const normalized = String(text).trim();
+
+  if (normalized.length <= maxLength) {
+    return normalized;
+  }
+
+  const sliced = normalized.slice(0, maxLength);
+  const lastSpace = sliced.lastIndexOf(" ");
+
+  if (lastSpace > Math.floor(maxLength * 0.6)) {
+    return `${sliced.slice(0, lastSpace).trimEnd()}…`;
+  }
+
+  return `${sliced.trimEnd()}…`;
 }
 
 function toArray(value) {
@@ -65,16 +149,37 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+  const controller = new AbortController();
+
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, timeoutMs);
+
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function fetchFeed() {
   for (const url of FEED_URLS) {
     try {
       console.log(`Trying RSS feed: ${url}`);
 
-      const response = await fetch(url, {
-        headers: {
-          "User-Agent": "OmarchyParsiBot/1.0",
+      const response = await fetchWithTimeout(
+        url,
+        {
+          headers: {
+            "User-Agent": "OmarchyParsiBot/1.0",
+          },
         },
-      });
+        FEED_TIMEOUT_MS,
+      );
 
       if (!response.ok) {
         console.log(`Feed returned ${response.status}`);
@@ -147,42 +252,32 @@ function parseFeed(xml) {
 }
 
 async function requestGeminiTranslation(model, prompt) {
-  const controller = new AbortController();
-
-  const timeout = setTimeout(() => {
-    controller.abort();
-  }, 20000);
-
-  try {
-    return await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
-      {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-goog-api-key": GEMINI_API_KEY,
-        },
-        signal: controller.signal,
-        body: JSON.stringify({
-          contents: [
-            {
-              parts: [
-                {
-                  text: prompt,
-                },
-              ],
-            },
-          ],
-          generationConfig: {
-            temperature: 0.2,
-            responseMimeType: "application/json",
-          },
-        }),
+  return fetchWithTimeout(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": GEMINI_API_KEY,
       },
-    );
-  } finally {
-    clearTimeout(timeout);
-  }
+      body: JSON.stringify({
+        contents: [
+          {
+            parts: [
+              {
+                text: prompt,
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.2,
+          responseMimeType: "application/json",
+        },
+      }),
+    },
+    GEMINI_TIMEOUT_MS,
+  );
 }
 
 async function translateToPersian(title, description) {
@@ -195,6 +290,8 @@ async function translateToPersian(title, description) {
       description,
     };
   }
+
+  const hasDescription = Boolean(description && description.trim());
 
   const prompt = `
 You are the Persian editor for a technology community focused on Omarchy.
@@ -240,6 +337,7 @@ Return ONLY valid JSON in exactly this shape:
   "title": "...",
   "description": "..."
 }
+${hasDescription ? "" : '(If Description is empty, return "" for "description".)'}
 
 Title:
 ${title}
@@ -247,8 +345,6 @@ ${title}
 Description:
 ${description}
 `;
-
-  const retryableStatuses = new Set([429, 500, 502, 503, 504]);
 
   // Two attempts per model.
   const attemptsPerModel = 2;
@@ -271,7 +367,7 @@ ${description}
           );
 
           if (
-            retryableStatuses.has(response.status) &&
+            RETRYABLE_STATUSES.has(response.status) &&
             attempt < attemptsPerModel
           ) {
             console.log(`Retrying ${model} in ${retryDelay / 1000}s...`);
@@ -292,14 +388,20 @@ ${description}
         }
 
         const translated = JSON.parse(text);
+        const translatedTitle =
+          typeof translated.title === "string" ? translated.title.trim() : "";
+        const translatedDescription =
+          typeof translated.description === "string"
+            ? translated.description.trim()
+            : "";
 
-        if (!translated.title || !translated.description) {
+        if (!translatedTitle || (hasDescription && !translatedDescription)) {
           throw new Error("Gemini returned incomplete translation.");
         }
 
         if (
-          !startsWithPersian(translated.title) ||
-          !startsWithPersian(translated.description)
+          !startsWithPersian(translatedTitle) ||
+          (hasDescription && !startsWithPersian(translatedDescription))
         ) {
           throw new Error("Gemini returned non-RTL-safe Persian text.");
         }
@@ -308,8 +410,8 @@ ${description}
 
         return {
           success: true,
-          title: translated.title.trim(),
-          description: translated.description.trim(),
+          title: translatedTitle,
+          description: hasDescription ? translatedDescription : "",
         };
       } catch (error) {
         console.error(
@@ -337,10 +439,10 @@ ${description}
 }
 
 async function sendTelegramMessage(item) {
-  const originalDescription = stripHtml(item.description).slice(0, 500);
+  const originalDescription = truncateAtWord(stripHtml(item.description), 500);
 
   const translated = await translateToPersian(
-    String(item.title),
+    stripHtml(item.title),
     originalDescription,
   );
 
@@ -365,32 +467,71 @@ async function sendTelegramMessage(item) {
 
   text += `\n\n${communityLine}`;
 
-  const response = await fetch(
-    `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        chat_id: CHAT_ID,
-        message_thread_id: Number(TOPIC_ID),
-        text,
-        parse_mode: "HTML",
-        disable_web_page_preview: false,
-      }),
-    },
-  );
+  const maxAttempts = 3;
 
-  const result = await response.json();
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const response = await fetchWithTimeout(
+        `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            chat_id: CHAT_ID,
+            message_thread_id: Number(TOPIC_ID),
+            text,
+            parse_mode: "HTML",
+            disable_web_page_preview: false,
+          }),
+        },
+        TELEGRAM_TIMEOUT_MS,
+      );
 
-  if (!response.ok || !result.ok) {
-    throw new Error(`Telegram error: ${JSON.stringify(result)}`);
+      const result = await response.json().catch(() => ({}));
+
+      if (response.ok && result.ok) {
+        return;
+      }
+
+      const retryAfterSec = result?.parameters?.retry_after;
+      const shouldRetry =
+        attempt < maxAttempts &&
+        (RETRYABLE_STATUSES.has(response.status) ||
+          typeof retryAfterSec === "number");
+
+      if (shouldRetry) {
+        const delayMs =
+          typeof retryAfterSec === "number"
+            ? (retryAfterSec + 1) * 1000
+            : attempt * 2000;
+        console.warn(
+          `Telegram attempt ${attempt}/${maxAttempts} failed (${response.status}). Retrying in ${delayMs / 1000}s...`,
+        );
+        await sleep(delayMs);
+        continue;
+      }
+
+      throw new Error(`Telegram error: ${JSON.stringify(result)}`);
+    } catch (error) {
+      if (attempt < maxAttempts && !String(error.message).startsWith("Telegram error:")) {
+        const delayMs = attempt * 2000;
+        console.warn(
+          `Telegram attempt ${attempt}/${maxAttempts} network error: ${error.message}. Retrying in ${delayMs / 1000}s...`,
+        );
+        await sleep(delayMs);
+        continue;
+      }
+
+      throw error;
+    }
   }
 }
 
 async function main() {
   const state = loadState();
+  const processedSet = new Set(state.processedIds);
 
   const xml = await fetchFeed();
 
@@ -409,8 +550,10 @@ async function main() {
   if (!state.lastItemId) {
     console.log(`First run. Setting baseline to: ${newestItem.title}`);
 
+    processedSet.add(newestItem.id);
     saveState({
       lastItemId: newestItem.id,
+      processedIds: [...processedSet],
       updatedAt: new Date().toISOString(),
     });
 
@@ -424,14 +567,21 @@ async function main() {
     return;
   }
 
-  let newItems;
+  let candidateItems;
 
   if (previousIndex === -1) {
     // If the old article has fallen
     // out of the feed, avoid flooding.
-    newItems = [newestItem];
+    candidateItems = [newestItem];
   } else {
-    newItems = items.slice(0, previousIndex).reverse();
+    candidateItems = items.slice(0, previousIndex).reverse();
+  }
+
+  const newItems = candidateItems.filter((item) => !processedSet.has(item.id));
+
+  if (newItems.length === 0) {
+    console.log("No new Omarchy news.");
+    return;
   }
 
   for (const item of newItems) {
@@ -439,8 +589,10 @@ async function main() {
 
     await sendTelegramMessage(item);
 
+    processedSet.add(item.id);
     saveState({
       lastItemId: item.id,
+      processedIds: [...processedSet],
       updatedAt: new Date().toISOString(),
     });
   }
