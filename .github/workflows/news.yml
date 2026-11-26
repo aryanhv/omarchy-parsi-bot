@@ -38,6 +38,7 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - name: Save bot state
+        if: always()
         run: |
           if [ ! -f state.json ]; then
             echo "No state file."
@@ -55,4 +56,5 @@ jobs:
           fi
 
           git commit -m "Update news bot state"
+          git pull --rebase origin main
           git push
