@@ -1,15 +1,26 @@
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { XMLParser } from "fast-xml-parser";
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 const TOPIC_ID = process.env.TELEGRAM_TOPIC_ID;
 
+const MESSAGE_FORMAT = ["markdown", "rich_markdown"].includes(
+  (process.env.TELEGRAM_MESSAGE_FORMAT || "html").toLowerCase(),
+)
+  ? "rich_markdown"
+  : "html";
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const GEMINI_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const STATE_FILE = "state.json";
+
+// Telegram Bot API Rich Message limit: up to 32,768 UTF-8 characters.
+const RICH_MESSAGE_MAX_CHARS = 32768;
 
 const RLM = "\u200F";
 const LRM = "\u200E";
@@ -21,10 +32,6 @@ const FEED_URLS = [
   "https://omarchy.org/rss.xml",
   "https://omarchy.org/feed.xml",
 ].filter(Boolean);
-
-if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
-  throw new Error("Missing Telegram environment variables.");
-}
 
 function loadState() {
   if (!fs.existsSync(STATE_FILE)) {
@@ -45,6 +52,18 @@ function escapeHtml(text = "") {
     .replaceAll(">", "&gt;");
 }
 
+/**
+ * Escapes characters that could unintentionally trigger formatting in Telegram
+ * Rich Markdown (https://core.telegram.org/bots/api#rich-message-formatting-options).
+ */
+export function escapeRichMarkdownText(text = "") {
+  return String(text).replace(/([\\*_~`[\]|=$<>])/g, "\\$1");
+}
+
+export function escapeRichMarkdownUrl(url = "") {
+  return String(url).replace(/([)\\])/g, "\\$1");
+}
+
 function stripHtml(text = "") {
   return String(text)
     .replace(/<[^>]*>/g, "")
@@ -59,6 +78,10 @@ function toArray(value) {
 
 function startsWithPersian(text = "") {
   return /^[\s\u200F]*[\u0600-\u06FF]/.test(text);
+}
+
+function containsPersian(text = "") {
+  return /[\u0600-\u06FF]/.test(text);
 }
 
 function sleep(ms) {
@@ -336,14 +359,62 @@ ${description}
   };
 }
 
-async function sendTelegramMessage(item) {
-  const originalDescription = stripHtml(item.description).slice(0, 500);
+/**
+ * Builds an InputRichMessage object for Telegram's sendRichMessage API using
+ * Rich Markdown formatting (https://core.telegram.org/bots/api#rich-message-formatting-options).
+ */
+export function buildRichMarkdownMessage(
+  markdown,
+  { isRtl, skipEntityDetection = false } = {},
+) {
+  const normalized = String(markdown).replace(/\r\n/g, "\n").trim();
 
-  const translated = await translateToPersian(
-    String(item.title),
-    originalDescription,
+  if (!normalized) {
+    throw new Error("Rich message markdown content cannot be empty.");
+  }
+
+  if (normalized.length > RICH_MESSAGE_MAX_CHARS) {
+    throw new Error(
+      `Rich message exceeds Telegram's ${RICH_MESSAGE_MAX_CHARS}-character limit (${normalized.length} chars).`,
+    );
+  }
+
+  const richMessage = {
+    markdown: normalized,
+  };
+
+  if (typeof isRtl === "boolean") {
+    richMessage.is_rtl = isRtl;
+  } else if (containsPersian(normalized)) {
+    richMessage.is_rtl = true;
+  }
+
+  if (skipEntityDetection) {
+    richMessage.skip_entity_detection = true;
+  }
+
+  return richMessage;
+}
+
+export function formatNewsRichMarkdown(item, translated) {
+  const sections = [`### 📰 ${escapeRichMarkdownText(translated.title)}`];
+
+  if (translated.description) {
+    sections.push(escapeRichMarkdownText(translated.description));
+  }
+
+  sections.push(
+    `[مطالعه خبر اصلی در Omarchy](${escapeRichMarkdownUrl(item.link)})`,
   );
 
+  sections.push(`🆔 [@OmarchyParsi](https://t.me/OmarchyParsi)`);
+
+  return buildRichMarkdownMessage(sections.join("\n\n"), {
+    isRtl: Boolean(translated.success),
+  });
+}
+
+export function formatNewsHtml(item, translated) {
   // Persian content gets explicit RTL.
   // English fallback gets no direction forcing.
   const contentDirection = translated.success ? RLM : "";
@@ -364,6 +435,88 @@ async function sendTelegramMessage(item) {
   text += `\n\n${sourceLine}`;
 
   text += `\n\n${communityLine}`;
+
+  return text;
+}
+
+/**
+ * Sends a Rich Markdown message using Telegram Bot API's sendRichMessage method.
+ */
+export async function sendTelegramRichMarkdown(
+  markdown,
+  {
+    isRtl,
+    skipEntityDetection = false,
+    dryRun = false,
+    chatId = CHAT_ID,
+    topicId = TOPIC_ID,
+    botToken = BOT_TOKEN,
+    fetchImpl = fetch,
+  } = {},
+) {
+  const richMessage = buildRichMarkdownMessage(markdown, {
+    isRtl,
+    skipEntityDetection,
+  });
+
+  const payload = {
+    chat_id: chatId,
+    rich_message: richMessage,
+  };
+
+  if (topicId) {
+    payload.message_thread_id = Number(topicId);
+  }
+
+  if (dryRun) {
+    console.log(JSON.stringify(payload, null, 2));
+    return { ok: true, dryRun: true, payload };
+  }
+
+  if (!botToken || !chatId) {
+    throw new Error(
+      "Missing Telegram environment variables (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID).",
+    );
+  }
+
+  const response = await fetchImpl(
+    `https://api.telegram.org/bot${botToken}/sendRichMessage`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    },
+  );
+
+  const result = await response.json();
+
+  if (!response.ok || !result.ok) {
+    throw new Error(`Telegram error: ${JSON.stringify(result)}`);
+  }
+
+  return result;
+}
+
+async function sendTelegramMessage(item) {
+  const originalDescription = stripHtml(item.description).slice(0, 500);
+
+  const translated = await translateToPersian(
+    String(item.title),
+    originalDescription,
+  );
+
+  if (MESSAGE_FORMAT === "rich_markdown") {
+    const richMessage = formatNewsRichMarkdown(item, translated);
+
+    await sendTelegramRichMarkdown(richMessage.markdown, {
+      isRtl: richMessage.is_rtl,
+    });
+    return;
+  }
+
+  const text = formatNewsHtml(item, translated);
 
   const response = await fetch(
     `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`,
@@ -389,7 +542,54 @@ async function sendTelegramMessage(item) {
   }
 }
 
+function parseCliArgs(argv) {
+  const args = {
+    markdown: null,
+    markdownFile: null,
+    isRtl: undefined,
+    skipEntityDetection: argv.includes("--skip-entity-detection"),
+    dryRun: argv.includes("--dry-run") || process.env.DRY_RUN === "1",
+  };
+
+  if (argv.includes("--rtl")) {
+    args.isRtl = true;
+  } else if (argv.includes("--ltr")) {
+    args.isRtl = false;
+  }
+
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--markdown" && argv[i + 1]) {
+      args.markdown = argv[i + 1];
+      i++;
+    } else if (argv[i] === "--markdown-file" && argv[i + 1]) {
+      args.markdownFile = argv[i + 1];
+      i++;
+    }
+  }
+
+  return args;
+}
+
 async function main() {
+  const cli = parseCliArgs(process.argv.slice(2));
+
+  if (cli.markdown !== null || cli.markdownFile !== null) {
+    const content = cli.markdownFile
+      ? fs.readFileSync(cli.markdownFile, "utf8")
+      : cli.markdown;
+
+    await sendTelegramRichMarkdown(content, {
+      isRtl: cli.isRtl,
+      skipEntityDetection: cli.skipEntityDetection,
+      dryRun: cli.dryRun,
+    });
+    return;
+  }
+
+  if (!BOT_TOKEN || !CHAT_ID || !TOPIC_ID) {
+    throw new Error("Missing Telegram environment variables.");
+  }
+
   const state = loadState();
 
   const xml = await fetchFeed();
@@ -446,7 +646,13 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exit(1);
-});
+const isDirectRun =
+  process.argv[1] &&
+  path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (isDirectRun) {
+  main().catch((error) => {
+    console.error(error);
+    process.exit(1);
+  });
+}

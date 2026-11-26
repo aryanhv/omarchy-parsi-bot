@@ -79,6 +79,27 @@ GEMINI_API_KEY
 
 Never commit API keys or bot tokens directly to the repository.
 
+Optional environment variables:
+
+```text
+TELEGRAM_MESSAGE_FORMAT   # "html" (default) or "markdown" (uses Telegram sendRichMessage)
+```
+
+## Sending Rich Markdown messages
+
+The bot supports Telegram Bot API [Rich Message Formatting Options](https://core.telegram.org/bots/api#rich-message-formatting-options) via `sendRichMessage` (`InputRichMessage.markdown` with native `is_rtl` support):
+
+```bash
+node bot.js --markdown "## عنوان خبر\n\nمتن با **تاکید** و [لینک](https://omarchy.org)"
+node bot.js --markdown-file announcement.md
+```
+
+Optional CLI flags:
+
+- `--rtl` / `--ltr` — explicitly set `rich_message.is_rtl` (auto-detected from Persian text by default)
+- `--skip-entity-detection` — sets `rich_message.skip_entity_detection: true`
+- `--dry-run` — prints the `sendRichMessage` JSON payload without sending
+
 ## Community
 
 Telegram:
